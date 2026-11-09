@@ -34,6 +34,7 @@ SHEET_ID = "15a2tp4FV-JWUG23H5sWzogdQouO_A2g45QUph7EVMuI"
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 TAB_DATA = "SUM_All Channel"
 TAB_CAMPAIGN = "SHP&LZD_Campaign"
+TAB_CHANNELS = {"shp": "Shopee", "lzd": "Lazada", "ttk": "TikTok"}  # per-channel tabs: Year | Month | Date | Chat Enquired | Responded Chats | Respond Rate
 TAB_SELLER_CENTER = "SellerCenter_30D"  # optional tab: Date | Shopee | Lazada | TikTok (the 30-day rate shown in each Seller Center that morning)
 YEAR = 2026
 
@@ -161,6 +162,44 @@ def parse_daily(raw: pd.DataFrame) -> pd.DataFrame:
     df = pd.DataFrame(out).sort_values("date").reset_index(drop=True)
     df["all_chat"] = df[[f"{k}_chat" for k in key.values()]].sum(axis=1)
     df["all_resp"] = df[[f"{k}_resp" for k in key.values()]].sum(axis=1)
+    return df
+
+
+def parse_channel_tab(raw: pd.DataFrame, key: str) -> pd.DataFrame:
+    """One channel tab: header row with Date, Chat Enquired, Responded Chats.
+    Returns date, <key>_chat, <key>_resp (responded rounded, not truncated)."""
+    rows = raw.values.tolist()
+    hdr_i = next(i for i, r in enumerate(rows) if any(str(v).strip().lower() == "date" for v in r))
+    hdr = [str(v).strip().lower() for v in rows[hdr_i]]
+    dcol = hdr.index("date")
+    ccol = next(j for j, v in enumerate(hdr) if v.startswith("chat enquired") or v.startswith("total chat"))
+    rcol = next(j for j, v in enumerate(hdr) if v.startswith("responded chat") or v.startswith("respond chat"))
+    out = {}
+    for r in rows[hdr_i + 1:]:
+        if dcol >= len(r):
+            continue
+        d = _parse_date(r[dcol], YEAR)
+        c = _num(r[ccol]) if ccol < len(r) else None
+        if d is None or c is None:
+            continue
+        rr = _num(r[rcol]) if rcol < len(r) else None
+        out[d] = {"date": d, f"{key}_chat": int(round(c)), f"{key}_resp": int(round(rr or 0))}
+    return pd.DataFrame(list(out.values()))
+
+
+def build_daily_from_channels(tabs: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Join the three channel tabs on date. A day counts only when all three
+    channels have a value (an in-progress day has blanks) and total volume > 0."""
+    df = None
+    for k, part in tabs.items():
+        df = part if df is None else df.merge(part, on="date", how="outer")
+    df = df.dropna(subset=[f"{k}_chat" for k in tabs]).copy()
+    for k in tabs:
+        df[f"{k}_chat"] = df[f"{k}_chat"].astype(int)
+        df[f"{k}_resp"] = df[f"{k}_resp"].fillna(0).astype(int)
+    df["all_chat"] = df[[f"{k}_chat" for k in tabs]].sum(axis=1)
+    df["all_resp"] = df[[f"{k}_resp" for k in tabs]].sum(axis=1)
+    df = df[df["all_chat"] > 0].sort_values("date").reset_index(drop=True)
     return df
 
 
@@ -335,7 +374,16 @@ def load_seller_center() -> pd.DataFrame:
 
 @st.cache_data(ttl=CACHE_TTL_SEC, show_spinner=False)
 def load_all() -> tuple[pd.DataFrame, pd.DataFrame, dt.datetime]:
-    daily = parse_daily(fetch_tab(TAB_DATA))
+    # Prefer the three channel tabs (the values copied from Seller Center). SUM_All Channel is a
+    # SUMIFS over them and its Lazada / TikTok formulas key on Shopee's date column, so it can
+    # show 0 for a channel on a day Shopee has not been filled yet. Fall back to it if a tab is missing.
+    try:
+        daily = build_daily_from_channels({k: parse_channel_tab(fetch_tab(name), k) for k, name in TAB_CHANNELS.items()})
+        source_note = "channel tabs Shopee / Lazada / TikTok"
+    except Exception:  # noqa: BLE001
+        daily = parse_daily(fetch_tab(TAB_DATA))
+        source_note = TAB_DATA
+    daily.attrs["source_note"] = source_note
     calendar = parse_calendar(fetch_tab(TAB_CAMPAIGN))
     daily = daily.merge(calendar, on="date", how="left")
     daily["type"] = daily["type"].fillna("BAU")
@@ -409,7 +457,7 @@ dmin, dmax = daily_all["date"].min(), daily_all["date"].max()
 # ---- sidebar: filters ---------------------------------------------------
 with st.sidebar:
     st.title("MKP Chat Respond")
-    st.caption(f"Source: [Google Sheet]({SHEET_URL})  \nData through **{dmax:%d %b %Y}**  \nLast read {fetched_at:%d %b %H:%M}")
+    st.caption(f"Source: [Google Sheet]({SHEET_URL}), tabs {daily_all.attrs.get('source_note', TAB_DATA)}  \nData through **{dmax:%d %b %Y}** (last complete day)  \nLast read {fetched_at:%d %b %H:%M}")
     if st.button("🔄 Refresh now", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -421,17 +469,34 @@ with st.sidebar:
     if "range" not in st.session_state:
         st.session_state["range"] = (max(dmin, dmax - dt.timedelta(days=89)), dmax)
 
+    # Seller Center window: the 30-day Chat Response Rate seen in Seller Center in the morning
+    # covers chats up to about two days before the check (TikTok reproduces to 0.1 pt on it).
+    sc_win_end = min(dmax, dt.date.today() - dt.timedelta(days=2))
+    sc_win_start = max(dmin, sc_win_end - dt.timedelta(days=KPI_WINDOW_DAYS - 1))
+
+    def _set_range(r):
+        st.session_state["range"] = r
+        st.session_state["range_input"] = r  # the date picker keeps its own state; set it too or it overrides the preset
+
     def preset(days: int | None):
         start = dt.date(dmax.year, 1, 1) if days is None else dmax - dt.timedelta(days=days - 1)
-        st.session_state["range"] = (max(dmin, start), dmax)
+        _set_range((max(dmin, start), dmax))
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    def preset_sc():
+        _set_range((sc_win_start, sc_win_end))
+
+    c0, c1, c2, c3, c4, c5 = st.columns(6)
+    c0.button("SC 30D", on_click=preset_sc, use_container_width=True, type="primary",
+              help=f"Seller Center window: {sc_win_start:%d %b} to {sc_win_end:%d %b}, the 30 days ending two days before today. "
+                   "Matches TikTok's Seller Center rate to about 0.1 pt and Shopee / Lazada to within about 1 pt (Seller Center rolls by the hour).")
     c1.button("L7D", on_click=preset, args=(7,), use_container_width=True)
     c2.button("L30D", on_click=preset, args=(30,), use_container_width=True)
     c3.button("L60D", on_click=preset, args=(60,), use_container_width=True)
     c4.button("L90D", on_click=preset, args=(90,), use_container_width=True)
     c5.button("YTD", on_click=preset, args=(None,), use_container_width=True)
-    rng = st.date_input("Custom period", value=st.session_state["range"], min_value=dmin, max_value=dmax, key="range_input")
+    if "range_input" not in st.session_state:
+        st.session_state["range_input"] = st.session_state["range"]
+    rng = st.date_input("Custom period", min_value=dmin, max_value=dmax, key="range_input")
     if isinstance(rng, tuple) and len(rng) == 2:
         st.session_state["range"] = rng
     start, end = st.session_state["range"]
@@ -455,7 +520,17 @@ st.caption(f"Showing **{start:%d %b %Y} to {end:%d %b %Y}** ({len(rows)} days"
 st.subheader("KPI monitor: respond rate, last 30 days")
 sc = load_seller_center()
 sc_last = sc.dropna(how="all", subset=["shp", "lzd", "ttk"]).iloc[-1] if len(sc) else None
-win = daily_all.tail(KPI_WINDOW_DAYS)
+today = dt.date.today()
+win_mode = st.radio(
+    "30-day window for the sheet calculation",
+    ["Seller Center style (ends two days before today)", "Latest 30 complete days in the sheet"],
+    horizontal=True, label_visibility="collapsed",
+    help="Seller Center's rolling 30-day rate seen in the morning covers chats up to about two days before the check "
+         "(TikTok reproduces to 0.1 pt on that window). The second option uses the newest 30 complete days in the sheet.",
+)
+sc_end = min(dmax, today - dt.timedelta(days=2))
+win = daily_all[daily_all["date"] <= sc_end].tail(KPI_WINDOW_DAYS) if win_mode.startswith("Seller") else daily_all.tail(KPI_WINDOW_DAYS)
+win_alt = daily_all.tail(KPI_WINDOW_DAYS) if win_mode.startswith("Seller") else daily_all[daily_all["date"] <= sc_end].tail(KPI_WINDOW_DAYS)
 kpi_rows = []
 for k, name, _ in CH:
     chat, resp = int(win[f"{k}_chat"].sum()), int(win[f"{k}_resp"].sum())
@@ -475,7 +550,8 @@ cols = st.columns(3)
 for col, kr in zip(cols, kpi_rows):
     with col:
         delta = None if kr["rate"] is None else f"{(kr['rate'] - kr['kpi']) * 100:+.1f} pts vs KPI {kr['kpi'] * 100:.0f}%"
-        st.metric(f"{kr['name']} respond rate" + (" (Seller Center)" if kr["official"] is not None else ""), fmt_pct(kr["rate"]), delta, delta_color="normal")
+        shown = f"{kr['rate'] * 100:.2f}%" if kr["official"] is not None else fmt_pct(kr["rate"])
+        st.metric(f"{kr['name']} respond rate" + (" (Seller Center)" if kr["official"] is not None else ""), shown, delta, delta_color="normal")
         line = f"{win['date'].min():%d %b} to {win['date'].max():%d %b} · {fmt_n(kr['resp'])} of {fmt_n(kr['chat'])} chats in the sheet"
         if kr["official"] is not None and kr["calc"] is not None:
             line += f" · sheet calc **{fmt_pct(kr['calc'])}** ({(kr['calc'] - kr['official']) * 100:+.1f} pts vs Seller Center)"
@@ -488,8 +564,39 @@ if below:
 else:
     st.success("All three channels meet their respond-rate KPI on the last 30 days.")
 
+with st.expander("Seller Center alignment: why the sheet figure can differ, and by how much"):
+    def _w(df):
+        return {k: rate(int(df[f"{k}_resp"].sum()), int(df[f"{k}_chat"].sum())) for k, _, _ in CH}
+    w_main, w_alt = _w(win), _w(win_alt)
+    rows_al = [
+        {"Figure": f"Sheet, {win['date'].min():%d %b} to {win['date'].max():%d %b} (shown above)", **{LABEL[k]: fmt_pct(w_main[k]) for k in w_main}},
+        {"Figure": f"Sheet, {win_alt['date'].min():%d %b} to {win_alt['date'].max():%d %b}", **{LABEL[k]: fmt_pct(w_alt[k]) for k in w_alt}},
+    ]
+    if sc_last is not None:
+        rows_al.append({"Figure": f"Seller Center, read {sc_last['date']:%d %b} morning", **{LABEL[k]: fmt_pct(None if pd.isna(sc_last[k]) else float(sc_last[k])) for k, _, _ in CH}})
+        rows_al.append({"Figure": "Gap: shown figure minus Seller Center (pts)",
+                        **{LABEL[k]: ("—" if pd.isna(sc_last[k]) or w_main[k] is None else f"{(w_main[k] - float(sc_last[k])) * 100:+.2f}") for k, _, _ in CH}})
+    st.dataframe(pd.DataFrame(rows_al), hide_index=True, use_container_width=True)
+    st.markdown(
+        "- **Seller Center rolls by the hour, the sheet by the day.** Each platform's 30-day rate is recalculated at the moment you open it "
+        "(30 × 24 hours back), while the sheet holds one total per calendar day copied from an export that is not updated hourly. "
+        "A morning check therefore sits between the sheet's window ending two days ago and the one ending yesterday; the exact figure cannot be rebuilt from daily totals.\n"
+        "- **TikTok**: the sheet's responded count is back-calculated from the 12-hour response rate shown in Seller Center, so the 30-day weighted rate on the "
+        "'two days before' window matches Seller Center to about 0.1 pt. Small residuals are rounding.\n"
+        "- **Shopee**: counts conversations replied within 12 hours and excludes some auto-replied or spam conversations in its own logic; the daily export "
+        "does not carry those flags, so the sheet is within about ±1 pt.\n"
+        "- **Lazada**: no daily window reproduces the Seller Center figure; one low day in the sheet (check 13 Oct, 29 of 53 responded) moves the 30-day rate by almost 2 pts, "
+        "so a single mis-entered day shows up as a persistent gap. Re-check suspicious days against Seller Center.\n"
+        f"- **For penalty monitoring, the Seller Center figure is the number of record.** Enter it each morning in the tab **{TAB_SELLER_CENTER}** "
+        "(Date, Shopee, Lazada, TikTok) and the dashboard shows it as the headline number with the sheet calculation underneath, so the KPI status always follows the platform's own figure."
+    )
+
 # ---- period summary tiles -----------------------------------------------
 st.subheader("Chat volume and respond rate in the selected period")
+if (start, end) == (sc_win_start, sc_win_end) and day_type == "All days":
+    st.info(f"Seller Center window selected ({start:%d %b} to {end:%d %b}): the rates below are the sheet's volume-weighted 30-day rates on the same window "
+            "Seller Center showed this morning. TikTok matches to about 0.1 pt; Shopee and Lazada can differ by up to about 1 pt because Seller Center rolls by the hour. "
+            f"The exact Seller Center figure is shown in the KPI monitor when it is entered in the {TAB_SELLER_CENTER} tab.")
 tiles = st.columns(4)
 for col, k in zip(tiles, ["all", "shp", "lzd", "ttk"]):
     chat, resp = int(rows[f"{k}_chat"].sum()), int(rows[f"{k}_resp"].sum())
@@ -499,7 +606,8 @@ for col, k in zip(tiles, ["all", "shp", "lzd", "ttk"]):
         st.markdown(f"<div style='border-left:6px solid {COLOR[k]};padding-left:10px'><b>{LABEL[k]}</b></div>", unsafe_allow_html=True)
         a, b = st.columns(2)
         a.metric("Total chats", fmt_n(chat), f"{chat / n:,.0f} per day", delta_color="off")
-        b.metric("Responded", fmt_n(resp), f"rate {fmt_pct(r)}", delta_color="off")
+        rate_txt = (f"{r * 100:.2f}%" if (start, end) == (sc_win_start, sc_win_end) and r is not None else fmt_pct(r))
+        b.metric("Responded", fmt_n(resp), f"rate {rate_txt}", delta_color="off")
         if k != "all" and r is not None:
             st.caption(("✅ above" if r >= KPI[k] else "⚠️ below") + f" KPI {KPI[k] * 100:.0f}% in this period")
 
