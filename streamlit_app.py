@@ -34,6 +34,8 @@ SHEET_ID = "15a2tp4FV-JWUG23H5sWzogdQouO_A2g45QUph7EVMuI"
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 TAB_DATA = "SUM_All Channel"
 TAB_CAMPAIGN = "SHP&LZD_Campaign"
+TAB_CHANNELS = {"shp": "Shopee", "lzd": "Lazada", "ttk": "TikTok"}  # per-channel tabs: Year | Month | Date | Chat Enquired | Responded Chats | Respond Rate
+TAB_SELLER_CENTER = "SellerCenter_30D"  # optional tab: Date | Shopee | Lazada | TikTok (the 30-day rate shown in each Seller Center that morning)
 YEAR = 2026
 
 CACHE_TTL_SEC = 300  # re-read the sheet at most every 5 minutes
@@ -143,19 +145,61 @@ def parse_daily(raw: pd.DataFrame) -> pd.DataFrame:
         if d is None:
             continue
         rec = {"date": d}
-        has = False
+        complete = True  # every channel must have a value; an in-progress day has blanks
+        any_volume = False  # a day whose formulas all show 0 (today, not yet filled) is skipped too
         for ch, k in key.items():
             c = _num(sec.get(("Total Chat", ch), [None] * (i + 1))[i]) if i < len(sec.get(("Total Chat", ch), [])) else None
             r_ = _num(sec.get(("Respond Chat", ch), [None] * (i + 1))[i]) if i < len(sec.get(("Respond Chat", ch), [])) else None
-            if c is not None:
-                has = True
-            rec[f"{k}_chat"] = int(c) if c is not None else 0
-            rec[f"{k}_resp"] = int(r_) if r_ is not None else 0
-        if has:
+            if c is None:
+                complete = False
+            if c is not None and c > 0:
+                any_volume = True
+            # TikTok responded chats are back-calculated in the sheet (rate x chats) and carry decimals: round, don't truncate
+            rec[f"{k}_chat"] = int(round(c)) if c is not None else 0
+            rec[f"{k}_resp"] = int(round(r_)) if r_ is not None else 0
+        if complete and any_volume:
             out.append(rec)
     df = pd.DataFrame(out).sort_values("date").reset_index(drop=True)
     df["all_chat"] = df[[f"{k}_chat" for k in key.values()]].sum(axis=1)
     df["all_resp"] = df[[f"{k}_resp" for k in key.values()]].sum(axis=1)
+    return df
+
+
+def parse_channel_tab(raw: pd.DataFrame, key: str) -> pd.DataFrame:
+    """One channel tab: header row with Date, Chat Enquired, Responded Chats.
+    Returns date, <key>_chat, <key>_resp (responded rounded, not truncated)."""
+    rows = raw.values.tolist()
+    hdr_i = next(i for i, r in enumerate(rows) if any(str(v).strip().lower() == "date" for v in r))
+    hdr = [str(v).strip().lower() for v in rows[hdr_i]]
+    dcol = hdr.index("date")
+    ccol = next(j for j, v in enumerate(hdr) if v.startswith("chat enquired") or v.startswith("total chat"))
+    rcol = next(j for j, v in enumerate(hdr) if v.startswith("responded chat") or v.startswith("respond chat"))
+    out = {}
+    for r in rows[hdr_i + 1:]:
+        if dcol >= len(r):
+            continue
+        d = _parse_date(r[dcol], YEAR)
+        c = _num(r[ccol]) if ccol < len(r) else None
+        if d is None or c is None:
+            continue
+        rr = _num(r[rcol]) if rcol < len(r) else None
+        out[d] = {"date": d, f"{key}_chat": int(round(c)), f"{key}_resp": int(round(rr or 0))}
+    return pd.DataFrame(list(out.values()))
+
+
+def build_daily_from_channels(tabs: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Join the three channel tabs on date. A day counts only when all three
+    channels have a value (an in-progress day has blanks) and total volume > 0."""
+    df = None
+    for k, part in tabs.items():
+        df = part if df is None else df.merge(part, on="date", how="outer")
+    df = df.dropna(subset=[f"{k}_chat" for k in tabs]).copy()
+    for k in tabs:
+        df[f"{k}_chat"] = df[f"{k}_chat"].astype(int)
+        df[f"{k}_resp"] = df[f"{k}_resp"].fillna(0).astype(int)
+    df["all_chat"] = df[[f"{k}_chat" for k in tabs]].sum(axis=1)
+    df["all_resp"] = df[[f"{k}_resp" for k in tabs]].sum(axis=1)
+    df = df[df["all_chat"] > 0].sort_values("date").reset_index(drop=True)
     return df
 
 
@@ -291,9 +335,55 @@ def parse_calendar(raw: pd.DataFrame, year: int = YEAR) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def _pct(v) -> float | None:
+    s = str(v).strip().replace("%", "")
+    n = _num(s)
+    if n is None:
+        return None
+    return n / 100 if n > 1.5 else n
+
+
+def parse_seller_center(raw: pd.DataFrame) -> pd.DataFrame:
+    """Optional 'SellerCenter_30D' tab: a row per morning check with the 30-day
+    Chat Response Rate read from each Seller Center. Columns found by header
+    name: Date, Shopee, Lazada, TikTok (values like 69.83% or 0.6983)."""
+    rows = raw.values.tolist()
+    hdr_i = next((i for i, r in enumerate(rows) if any(str(v).strip().lower() == "date" for v in r)), None)
+    if hdr_i is None:
+        return pd.DataFrame(columns=["date", "shp", "lzd", "ttk"])
+    hdr = [str(v).strip().lower() for v in rows[hdr_i]]
+    col = {name: hdr.index(name) for name in ("date", "shopee", "lazada", "tiktok") if name in hdr}
+    out = []
+    for r in rows[hdr_i + 1:]:
+        d = _parse_date(r[col["date"]], YEAR) if "date" in col else None
+        if d is None:
+            continue
+        out.append({"date": d, "shp": _pct(r[col["shopee"]]) if "shopee" in col else None,
+                    "lzd": _pct(r[col["lazada"]]) if "lazada" in col else None,
+                    "ttk": _pct(r[col["tiktok"]]) if "tiktok" in col else None})
+    return pd.DataFrame(out).sort_values("date") if out else pd.DataFrame(columns=["date", "shp", "lzd", "ttk"])
+
+
+@st.cache_data(ttl=CACHE_TTL_SEC, show_spinner=False)
+def load_seller_center() -> pd.DataFrame:
+    try:
+        return parse_seller_center(fetch_tab(TAB_SELLER_CENTER))
+    except Exception:  # noqa: BLE001  (tab not created yet)
+        return pd.DataFrame(columns=["date", "shp", "lzd", "ttk"])
+
+
 @st.cache_data(ttl=CACHE_TTL_SEC, show_spinner=False)
 def load_all() -> tuple[pd.DataFrame, pd.DataFrame, dt.datetime]:
-    daily = parse_daily(fetch_tab(TAB_DATA))
+    # Prefer the three channel tabs (the values copied from Seller Center). SUM_All Channel is a
+    # SUMIFS over them and its Lazada / TikTok formulas key on Shopee's date column, so it can
+    # show 0 for a channel on a day Shopee has not been filled yet. Fall back to it if a tab is missing.
+    try:
+        daily = build_daily_from_channels({k: parse_channel_tab(fetch_tab(name), k) for k, name in TAB_CHANNELS.items()})
+        source_note = "channel tabs Shopee / Lazada / TikTok"
+    except Exception:  # noqa: BLE001
+        daily = parse_daily(fetch_tab(TAB_DATA))
+        source_note = TAB_DATA
+    daily.attrs["source_note"] = source_note
     calendar = parse_calendar(fetch_tab(TAB_CAMPAIGN))
     daily = daily.merge(calendar, on="date", how="left")
     daily["type"] = daily["type"].fillna("BAU")
@@ -367,7 +457,7 @@ dmin, dmax = daily_all["date"].min(), daily_all["date"].max()
 # ---- sidebar: filters ---------------------------------------------------
 with st.sidebar:
     st.title("MKP Chat Respond")
-    st.caption(f"Source: [Google Sheet]({SHEET_URL})  \nData through **{dmax:%d %b %Y}**  \nLast read {fetched_at:%d %b %H:%M}")
+    st.caption(f"Source: [Google Sheet]({SHEET_URL}), tabs {daily_all.attrs.get('source_note', TAB_DATA)}  \nData through **{dmax:%d %b %Y}** (last complete day)  \nLast read {fetched_at:%d %b %H:%M}")
     if st.button("🔄 Refresh now", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -379,9 +469,14 @@ with st.sidebar:
     if "range" not in st.session_state:
         st.session_state["range"] = (max(dmin, dmax - dt.timedelta(days=89)), dmax)
 
+    def set_range(start: dt.date, end: dt.date):
+        # the date picker (key "range_input") keeps its own value, so update both
+        st.session_state["range"] = (start, end)
+        st.session_state["range_input"] = (start, end)
+
     def preset(days: int | None):
         start = dt.date(dmax.year, 1, 1) if days is None else dmax - dt.timedelta(days=days - 1)
-        st.session_state["range"] = (max(dmin, start), dmax)
+        set_range(max(dmin, start), dmax)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.button("L7D", on_click=preset, args=(7,), use_container_width=True)
@@ -389,7 +484,19 @@ with st.sidebar:
     c3.button("L60D", on_click=preset, args=(60,), use_container_width=True)
     c4.button("L90D", on_click=preset, args=(90,), use_container_width=True)
     c5.button("YTD", on_click=preset, args=(None,), use_container_width=True)
-    rng = st.date_input("Custom period", value=st.session_state["range"], min_value=dmin, max_value=dmax, key="range_input")
+
+    def preset_sc():
+        # Seller Center logic: the 30-day Chat Response Rate seen in the morning covers chats up to
+        # two days before the check (30 x 24 h rolling, daily export lags). Capped at the last complete day.
+        end = min(dmax, dt.date.today() - dt.timedelta(days=2))
+        set_range(max(dmin, end - dt.timedelta(days=KPI_WINDOW_DAYS - 1)), end)
+
+    st.button("Seller Center 30D", on_click=preset_sc, use_container_width=True,
+              help="30 days ending two days before today, the window Seller Center's morning figure covers. "
+                   "TikTok matches to about 0.1 pt; Shopee and Lazada are within about 1 to 2 pts for the reasons in the KPI section.")
+    if "range_input" not in st.session_state:
+        st.session_state["range_input"] = st.session_state["range"]
+    rng = st.date_input("Custom period", min_value=dmin, max_value=dmax, key="range_input")
     if isinstance(rng, tuple) and len(rng) == 2:
         st.session_state["range"] = rng
     start, end = st.session_state["range"]
@@ -410,29 +517,88 @@ st.caption(f"Showing **{start:%d %b %Y} to {end:%d %b %Y}** ({len(rows)} days"
            + (f", {day_type} only" if day_type != "All days" else "") + "). Colours: all channels red, Shopee orange, Lazada blue, TikTok grey.")
 
 # ---- KPI monitor (fixed last-30-day windows) ----------------------------
-st.subheader("KPI monitor: respond rate, last 30 days of data")
-win = daily_all.tail(KPI_WINDOW_DAYS)
+st.subheader("KPI monitor: respond rate, last 30 days")
+sc = load_seller_center()
+sc_last = sc.dropna(how="all", subset=["shp", "lzd", "ttk"]).iloc[-1] if len(sc) else None
+today = dt.date.today()
+win_mode = st.radio(
+    "30-day window for the sheet calculation",
+    ["Seller Center style (ends two days before today)", "Latest 30 complete days in the sheet"],
+    horizontal=True, label_visibility="collapsed",
+    help="Seller Center's rolling 30-day rate seen in the morning covers chats up to about two days before the check "
+         "(TikTok reproduces to 0.1 pt on that window). The second option uses the newest 30 complete days in the sheet.",
+)
+sc_end = min(dmax, today - dt.timedelta(days=2))
+win = daily_all[daily_all["date"] <= sc_end].tail(KPI_WINDOW_DAYS) if win_mode.startswith("Seller") else daily_all.tail(KPI_WINDOW_DAYS)
+win_alt = daily_all.tail(KPI_WINDOW_DAYS) if win_mode.startswith("Seller") else daily_all[daily_all["date"] <= sc_end].tail(KPI_WINDOW_DAYS)
 kpi_rows = []
 for k, name, _ in CH:
     chat, resp = int(win[f"{k}_chat"].sum()), int(win[f"{k}_resp"].sum())
-    r = rate(resp, chat)
-    kpi_rows.append({"key": k, "name": name, "chat": chat, "resp": resp, "rate": r, "kpi": KPI[k],
+    calc = rate(resp, chat)
+    official = None if sc_last is None or pd.isna(sc_last[k]) else float(sc_last[k])
+    r = official if official is not None else calc  # Seller Center's own figure is the KPI of record when it has been entered
+    kpi_rows.append({"key": k, "name": name, "chat": chat, "resp": resp, "rate": r, "calc": calc, "official": official, "kpi": KPI[k],
                      "ok": r is not None and r >= KPI[k], "gap_chats": max(0, math.ceil(KPI[k] * chat) - resp)})
+if sc_last is not None:
+    st.caption(f"Big number = the 30-day Chat Response Rate read from each Seller Center on **{sc_last['date']:%d %b %Y}** (tab '{TAB_SELLER_CENTER}'). "
+               "Below it, the sheet calculation (responded ÷ total chats over the last 30 days with data) and the gap between the two.")
+else:
+    st.caption("Sheet calculation: responded chats ÷ total chats over the last 30 days with data. "
+               f"To show the exact Seller Center figure instead, add a tab **{TAB_SELLER_CENTER}** to the Google Sheet with columns Date, Shopee, Lazada, TikTok "
+               "and enter the 30-day Chat Response Rate from each Seller Center each morning; the dashboard will pick it up and show the sheet calculation as the secondary number.")
 cols = st.columns(3)
 for col, kr in zip(cols, kpi_rows):
     with col:
         delta = None if kr["rate"] is None else f"{(kr['rate'] - kr['kpi']) * 100:+.1f} pts vs KPI {kr['kpi'] * 100:.0f}%"
-        st.metric(f"{kr['name']} respond rate", fmt_pct(kr["rate"]), delta, delta_color="normal")
-        st.caption(f"{win['date'].min():%d %b} to {win['date'].max():%d %b} · {fmt_n(kr['resp'])} of {fmt_n(kr['chat'])} chats"
-                   + ("" if kr["ok"] else f" · needs **{fmt_n(kr['gap_chats'])}** more responded chats"))
+        shown = f"{kr['rate'] * 100:.2f}%" if kr["official"] is not None else fmt_pct(kr["rate"])
+        st.metric(f"{kr['name']} respond rate" + (" (Seller Center)" if kr["official"] is not None else ""), shown, delta, delta_color="normal")
+        line = f"{win['date'].min():%d %b} to {win['date'].max():%d %b} · {fmt_n(kr['resp'])} of {fmt_n(kr['chat'])} chats in the sheet"
+        if kr["official"] is not None and kr["calc"] is not None:
+            line += f" · sheet calc **{fmt_pct(kr['calc'])}** ({(kr['calc'] - kr['official']) * 100:+.1f} pts vs Seller Center)"
+        if not kr["ok"]:
+            line += f" · needs about **{fmt_n(kr['gap_chats'])}** more responded chats"
+        st.caption(line)
 below = [kr for kr in kpi_rows if not kr["ok"]]
 if below:
     st.error("Below KPI: " + ", ".join(f"{kr['name']} {fmt_pct(kr['rate'])} (KPI {kr['kpi'] * 100:.0f}%)" for kr in below))
 else:
     st.success("All three channels meet their respond-rate KPI on the last 30 days.")
 
+with st.expander("Seller Center alignment: why the sheet figure can differ, and by how much"):
+    def _w(df):
+        return {k: rate(int(df[f"{k}_resp"].sum()), int(df[f"{k}_chat"].sum())) for k, _, _ in CH}
+    w_main, w_alt = _w(win), _w(win_alt)
+    rows_al = [
+        {"Figure": f"Sheet, {win['date'].min():%d %b} to {win['date'].max():%d %b} (shown above)", **{LABEL[k]: fmt_pct(w_main[k]) for k in w_main}},
+        {"Figure": f"Sheet, {win_alt['date'].min():%d %b} to {win_alt['date'].max():%d %b}", **{LABEL[k]: fmt_pct(w_alt[k]) for k in w_alt}},
+    ]
+    if sc_last is not None:
+        rows_al.append({"Figure": f"Seller Center, read {sc_last['date']:%d %b} morning", **{LABEL[k]: fmt_pct(None if pd.isna(sc_last[k]) else float(sc_last[k])) for k, _, _ in CH}})
+        rows_al.append({"Figure": "Gap: shown figure minus Seller Center (pts)",
+                        **{LABEL[k]: ("—" if pd.isna(sc_last[k]) or w_main[k] is None else f"{(w_main[k] - float(sc_last[k])) * 100:+.2f}") for k, _, _ in CH}})
+    st.dataframe(pd.DataFrame(rows_al), hide_index=True, use_container_width=True)
+    st.markdown(
+        "- **Seller Center rolls by the hour, the sheet by the day.** Each platform's 30-day rate is recalculated at the moment you open it "
+        "(30 × 24 hours back), while the sheet holds one total per calendar day copied from an export that is not updated hourly. "
+        "A morning check therefore sits between the sheet's window ending two days ago and the one ending yesterday; the exact figure cannot be rebuilt from daily totals.\n"
+        "- **TikTok**: the sheet's responded count is back-calculated from the 12-hour response rate shown in Seller Center, so the 30-day weighted rate on the "
+        "'two days before' window matches Seller Center to about 0.1 pt. Small residuals are rounding.\n"
+        "- **Shopee**: counts conversations replied within 12 hours and excludes some auto-replied or spam conversations in its own logic; the daily export "
+        "does not carry those flags, so the sheet is within about ±1 pt.\n"
+        "- **Lazada**: no daily window reproduces the Seller Center figure; one low day in the sheet (check 13 Oct, 29 of 53 responded) moves the 30-day rate by almost 2 pts, "
+        "so a single mis-entered day shows up as a persistent gap. Re-check suspicious days against Seller Center.\n"
+        f"- **For penalty monitoring, the Seller Center figure is the number of record.** Enter it each morning in the tab **{TAB_SELLER_CENTER}** "
+        "(Date, Shopee, Lazada, TikTok) and the dashboard shows it as the headline number with the sheet calculation underneath, so the KPI status always follows the platform's own figure."
+    )
+
 # ---- period summary tiles -----------------------------------------------
 st.subheader("Chat volume and respond rate in the selected period")
+_sc_end = min(dmax, dt.date.today() - dt.timedelta(days=2))
+is_sc_window = (start, end) == (max(dmin, _sc_end - dt.timedelta(days=KPI_WINDOW_DAYS - 1)), _sc_end)
+if is_sc_window:
+    st.info(f"Seller Center 30D window: {start:%d %b} to {end:%d %b}, the period the Seller Center morning figure covers. "
+            "Rates shown with 2 decimals. TikTok reproduces Seller Center to about 0.1 pt; Shopee and Lazada are within about 1 to 2 pts "
+            "(hourly rolling in Seller Center vs daily totals in the sheet; see the KPI section for details).")
 tiles = st.columns(4)
 for col, k in zip(tiles, ["all", "shp", "lzd", "ttk"]):
     chat, resp = int(rows[f"{k}_chat"].sum()), int(rows[f"{k}_resp"].sum())
@@ -442,7 +608,7 @@ for col, k in zip(tiles, ["all", "shp", "lzd", "ttk"]):
         st.markdown(f"<div style='border-left:6px solid {COLOR[k]};padding-left:10px'><b>{LABEL[k]}</b></div>", unsafe_allow_html=True)
         a, b = st.columns(2)
         a.metric("Total chats", fmt_n(chat), f"{chat / n:,.0f} per day", delta_color="off")
-        b.metric("Responded", fmt_n(resp), f"rate {fmt_pct(r)}", delta_color="off")
+        b.metric("Responded", fmt_n(resp), f"rate {r * 100:.2f}%" if (is_sc_window and r is not None) else f"rate {fmt_pct(r)}", delta_color="off")
         if k != "all" and r is not None:
             st.caption(("✅ above" if r >= KPI[k] else "⚠️ below") + f" KPI {KPI[k] * 100:.0f}% in this period")
 
