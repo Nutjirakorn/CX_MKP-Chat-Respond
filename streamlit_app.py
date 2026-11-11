@@ -501,68 +501,44 @@ st.title("MKP Chat Respond Dashboard")
 st.caption(f"Showing **{start:%d %b %Y} to {end:%d %b %Y}** ({len(rows)} days"
            + (f", {day_type} only" if day_type != "All days" else "") + "). Colours: all channels red, Shopee orange, Lazada blue, TikTok grey.")
 
-# ---- KPI monitor (fixed last-30-day windows) ----------------------------
+# ---- KPI monitor: last 30 days, total replied ÷ total chats per channel ----
 st.subheader("KPI monitor: respond rate, last 30 days")
+win = daily_all.tail(KPI_WINDOW_DAYS)  # the latest 30 complete days in the sheet, the same window for every channel
 sc = load_seller_center()
 sc_last = sc.dropna(how="all", subset=["shp", "lzd", "ttk"]).iloc[-1] if len(sc) else None
-win = daily_all.tail(KPI_WINDOW_DAYS)  # latest 30 complete days in the sheet
 kpi_rows = []
 for k, name, _ in CH:
     chat, resp = int(win[f"{k}_chat"].sum()), int(win[f"{k}_resp"].sum())
-    calc = rate(resp, chat)
+    r = rate(resp, chat)  # total responded chats ÷ total chats over the 30 days
     official = None if sc_last is None or pd.isna(sc_last[k]) else float(sc_last[k])
-    r = official if official is not None else calc  # Seller Center's own figure is the KPI of record when it has been entered
-    kpi_rows.append({"key": k, "name": name, "chat": chat, "resp": resp, "rate": r, "calc": calc, "official": official, "kpi": KPI[k],
+    kpi_rows.append({"key": k, "name": name, "chat": chat, "resp": resp, "rate": r, "official": official, "kpi": KPI[k],
                      "ok": r is not None and r >= KPI[k], "gap_chats": max(0, math.ceil(KPI[k] * chat) - resp)})
-if sc_last is not None:
-    st.caption(f"Big number = the 30-day Chat Response Rate read from each Seller Center on **{sc_last['date']:%d %b %Y}** (tab '{TAB_SELLER_CENTER}'). "
-               "Below it, the sheet calculation (responded ÷ total chats over the last 30 days with data) and the gap between the two.")
-else:
-    st.caption("Sheet calculation: responded chats ÷ total chats over the last 30 days with data. "
-               f"To show the exact Seller Center figure instead, add a tab **{TAB_SELLER_CENTER}** to the Google Sheet with columns Date, Shopee, Lazada, TikTok "
-               "and enter the 30-day Chat Response Rate from each Seller Center each morning; the dashboard will pick it up and show the sheet calculation as the secondary number.")
+st.caption(f"Window **{win['date'].min():%d %b} to {win['date'].max():%d %b %Y}** ({len(win)} days with data for all three channels). "
+           "Rate = total responded chats ÷ total chats in the window, per channel.")
 cols = st.columns(3)
 for col, kr in zip(cols, kpi_rows):
     with col:
         delta = None if kr["rate"] is None else f"{(kr['rate'] - kr['kpi']) * 100:+.1f} pts vs KPI {kr['kpi'] * 100:.0f}%"
-        shown = f"{kr['rate'] * 100:.2f}%" if kr["official"] is not None else fmt_pct(kr["rate"])
-        st.metric(f"{kr['name']} respond rate" + (" (Seller Center)" if kr["official"] is not None else ""), shown, delta, delta_color="normal")
-        line = f"{win['date'].min():%d %b} to {win['date'].max():%d %b} · {fmt_n(kr['resp'])} of {fmt_n(kr['chat'])} chats in the sheet"
-        if kr["official"] is not None and kr["calc"] is not None:
-            line += f" · sheet calc **{fmt_pct(kr['calc'])}** ({(kr['calc'] - kr['official']) * 100:+.1f} pts vs Seller Center)"
+        st.metric(f"{kr['name']} respond rate", fmt_pct(kr["rate"]), delta, delta_color="normal")
+        line = f"{fmt_n(kr['resp'])} of {fmt_n(kr['chat'])} chats"
         if not kr["ok"]:
             line += f" · needs about **{fmt_n(kr['gap_chats'])}** more responded chats"
+        if kr["official"] is not None and kr["rate"] is not None:
+            line += f" · Seller Center {sc_last['date']:%d %b}: **{kr['official'] * 100:.2f}%** ({(kr['rate'] - kr['official']) * 100:+.1f} pts)"
         st.caption(line)
 below = [kr for kr in kpi_rows if not kr["ok"]]
 if below:
     st.error("Below KPI: " + ", ".join(f"{kr['name']} {fmt_pct(kr['rate'])} (KPI {kr['kpi'] * 100:.0f}%)" for kr in below))
 else:
     st.success("All three channels meet their respond-rate KPI on the last 30 days.")
-
-with st.expander("Seller Center alignment: why the sheet figure can differ, and by how much"):
-    def _w(df):
-        return {k: rate(int(df[f"{k}_resp"].sum()), int(df[f"{k}_chat"].sum())) for k, _, _ in CH}
-    w_main = _w(win)
-    rows_al = [
-        {"Figure": f"Sheet, {win['date'].min():%d %b} to {win['date'].max():%d %b}", **{LABEL[k]: fmt_pct(w_main[k]) for k in w_main}},
-    ]
-    if sc_last is not None:
-        rows_al.append({"Figure": f"Seller Center, read {sc_last['date']:%d %b} morning", **{LABEL[k]: fmt_pct(None if pd.isna(sc_last[k]) else float(sc_last[k])) for k, _, _ in CH}})
-        rows_al.append({"Figure": "Gap: shown figure minus Seller Center (pts)",
-                        **{LABEL[k]: ("—" if pd.isna(sc_last[k]) or w_main[k] is None else f"{(w_main[k] - float(sc_last[k])) * 100:+.2f}") for k, _, _ in CH}})
-    st.dataframe(pd.DataFrame(rows_al), hide_index=True, use_container_width=True)
-    st.markdown(
-        "- **Seller Center rolls by the hour, the sheet by the day.** Each platform's 30-day rate is recalculated at the moment you open it "
-        "(30 × 24 hours back), while the sheet holds one total per calendar day copied from an export that is not updated hourly. "
-        "The exact figure therefore cannot be rebuilt from daily totals; expect a difference of up to about 1 to 2 pts.\n"
-        "- **TikTok**: the sheet's responded count is back-calculated from the 12-hour response rate shown in Seller Center, so it tracks Seller Center closely; small residuals are rounding.\n"
-        "- **Shopee**: counts conversations replied within 12 hours and excludes some auto-replied or spam conversations in its own logic; the daily export "
-        "does not carry those flags, so the sheet is within about ±1 pt.\n"
-        "- **Lazada**: no daily window reproduces the Seller Center figure; one low day in the sheet (check 13 Oct, 29 of 53 responded) moves the 30-day rate by almost 2 pts, "
-        "so a single mis-entered day shows up as a persistent gap. Re-check suspicious days against Seller Center.\n"
-        f"- **For penalty monitoring, the Seller Center figure is the number of record.** Enter it each morning in the tab **{TAB_SELLER_CENTER}** "
-        "(Date, Shopee, Lazada, TikTok) and the dashboard shows it as the headline number with the sheet calculation underneath, so the KPI status always follows the platform's own figure."
-    )
+if sc_last is not None:
+    with st.expander("Why the sheet figure can differ from Seller Center"):
+        st.markdown(
+            "- Seller Center recalculates its 30-day rate at the moment you open it (30 × 24 hours back), while the sheet holds one total per calendar day, "
+            "so a difference of up to about 1 to 2 pts is normal.\n"
+            "- TikTok's responded count is back-calculated from the 12-hour response rate shown in Seller Center; Shopee excludes some auto-replied or spam conversations that the daily export does not flag.\n"
+            "- A single mis-entered day moves the 30-day rate by 1 to 2 pts on a low-volume channel such as Lazada, so re-check unusual days against Seller Center."
+        )
 
 # ---- period summary tiles -----------------------------------------------
 st.subheader("Chat volume and respond rate in the selected period")
