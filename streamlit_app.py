@@ -466,17 +466,13 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Time frame")
-    if "range" not in st.session_state:
-        st.session_state["range"] = (max(dmin, dmax - dt.timedelta(days=89)), dmax)
-
-    def set_range(start: dt.date, end: dt.date):
-        # the date picker (key "range_input") keeps its own value, so update both
-        st.session_state["range"] = (start, end)
-        st.session_state["range_input"] = (start, end)
+    if "range_input" not in st.session_state:
+        st.session_state["range_input"] = (max(dmin, dmax - dt.timedelta(days=89)), dmax)
 
     def preset(days: int | None):
+        # the date picker is keyed, so its value must be changed through its own session-state key
         start = dt.date(dmax.year, 1, 1) if days is None else dmax - dt.timedelta(days=days - 1)
-        set_range(max(dmin, start), dmax)
+        st.session_state["range_input"] = (max(dmin, start), dmax)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.button("L7D", on_click=preset, args=(7,), use_container_width=True)
@@ -484,22 +480,11 @@ with st.sidebar:
     c3.button("L60D", on_click=preset, args=(60,), use_container_width=True)
     c4.button("L90D", on_click=preset, args=(90,), use_container_width=True)
     c5.button("YTD", on_click=preset, args=(None,), use_container_width=True)
-
-    def preset_sc():
-        # Seller Center logic: the 30-day Chat Response Rate seen in the morning covers chats up to
-        # two days before the check (30 x 24 h rolling, daily export lags). Capped at the last complete day.
-        end = min(dmax, dt.date.today() - dt.timedelta(days=2))
-        set_range(max(dmin, end - dt.timedelta(days=KPI_WINDOW_DAYS - 1)), end)
-
-    st.button("Seller Center 30D", on_click=preset_sc, use_container_width=True,
-              help="30 days ending two days before today, the window Seller Center's morning figure covers. "
-                   "TikTok matches to about 0.1 pt; Shopee and Lazada are within about 1 to 2 pts for the reasons in the KPI section.")
-    if "range_input" not in st.session_state:
-        st.session_state["range_input"] = st.session_state["range"]
     rng = st.date_input("Custom period", min_value=dmin, max_value=dmax, key="range_input")
     if isinstance(rng, tuple) and len(rng) == 2:
-        st.session_state["range"] = rng
-    start, end = st.session_state["range"]
+        start, end = rng
+    else:  # a single date picked while the user is still choosing the end date
+        start = end = rng[0] if isinstance(rng, tuple) else rng
     day_type = st.selectbox("Day type", ["All days"] + DAY_TYPES)
 
     st.divider()
@@ -520,17 +505,7 @@ st.caption(f"Showing **{start:%d %b %Y} to {end:%d %b %Y}** ({len(rows)} days"
 st.subheader("KPI monitor: respond rate, last 30 days")
 sc = load_seller_center()
 sc_last = sc.dropna(how="all", subset=["shp", "lzd", "ttk"]).iloc[-1] if len(sc) else None
-today = dt.date.today()
-win_mode = st.radio(
-    "30-day window for the sheet calculation",
-    ["Seller Center style (ends two days before today)", "Latest 30 complete days in the sheet"],
-    horizontal=True, label_visibility="collapsed",
-    help="Seller Center's rolling 30-day rate seen in the morning covers chats up to about two days before the check "
-         "(TikTok reproduces to 0.1 pt on that window). The second option uses the newest 30 complete days in the sheet.",
-)
-sc_end = min(dmax, today - dt.timedelta(days=2))
-win = daily_all[daily_all["date"] <= sc_end].tail(KPI_WINDOW_DAYS) if win_mode.startswith("Seller") else daily_all.tail(KPI_WINDOW_DAYS)
-win_alt = daily_all.tail(KPI_WINDOW_DAYS) if win_mode.startswith("Seller") else daily_all[daily_all["date"] <= sc_end].tail(KPI_WINDOW_DAYS)
+win = daily_all.tail(KPI_WINDOW_DAYS)  # latest 30 complete days in the sheet
 kpi_rows = []
 for k, name, _ in CH:
     chat, resp = int(win[f"{k}_chat"].sum()), int(win[f"{k}_resp"].sum())
@@ -567,10 +542,9 @@ else:
 with st.expander("Seller Center alignment: why the sheet figure can differ, and by how much"):
     def _w(df):
         return {k: rate(int(df[f"{k}_resp"].sum()), int(df[f"{k}_chat"].sum())) for k, _, _ in CH}
-    w_main, w_alt = _w(win), _w(win_alt)
+    w_main = _w(win)
     rows_al = [
-        {"Figure": f"Sheet, {win['date'].min():%d %b} to {win['date'].max():%d %b} (shown above)", **{LABEL[k]: fmt_pct(w_main[k]) for k in w_main}},
-        {"Figure": f"Sheet, {win_alt['date'].min():%d %b} to {win_alt['date'].max():%d %b}", **{LABEL[k]: fmt_pct(w_alt[k]) for k in w_alt}},
+        {"Figure": f"Sheet, {win['date'].min():%d %b} to {win['date'].max():%d %b}", **{LABEL[k]: fmt_pct(w_main[k]) for k in w_main}},
     ]
     if sc_last is not None:
         rows_al.append({"Figure": f"Seller Center, read {sc_last['date']:%d %b} morning", **{LABEL[k]: fmt_pct(None if pd.isna(sc_last[k]) else float(sc_last[k])) for k, _, _ in CH}})
@@ -580,9 +554,8 @@ with st.expander("Seller Center alignment: why the sheet figure can differ, and 
     st.markdown(
         "- **Seller Center rolls by the hour, the sheet by the day.** Each platform's 30-day rate is recalculated at the moment you open it "
         "(30 × 24 hours back), while the sheet holds one total per calendar day copied from an export that is not updated hourly. "
-        "A morning check therefore sits between the sheet's window ending two days ago and the one ending yesterday; the exact figure cannot be rebuilt from daily totals.\n"
-        "- **TikTok**: the sheet's responded count is back-calculated from the 12-hour response rate shown in Seller Center, so the 30-day weighted rate on the "
-        "'two days before' window matches Seller Center to about 0.1 pt. Small residuals are rounding.\n"
+        "The exact figure therefore cannot be rebuilt from daily totals; expect a difference of up to about 1 to 2 pts.\n"
+        "- **TikTok**: the sheet's responded count is back-calculated from the 12-hour response rate shown in Seller Center, so it tracks Seller Center closely; small residuals are rounding.\n"
         "- **Shopee**: counts conversations replied within 12 hours and excludes some auto-replied or spam conversations in its own logic; the daily export "
         "does not carry those flags, so the sheet is within about ±1 pt.\n"
         "- **Lazada**: no daily window reproduces the Seller Center figure; one low day in the sheet (check 13 Oct, 29 of 53 responded) moves the 30-day rate by almost 2 pts, "
@@ -593,12 +566,6 @@ with st.expander("Seller Center alignment: why the sheet figure can differ, and 
 
 # ---- period summary tiles -----------------------------------------------
 st.subheader("Chat volume and respond rate in the selected period")
-_sc_end = min(dmax, dt.date.today() - dt.timedelta(days=2))
-is_sc_window = (start, end) == (max(dmin, _sc_end - dt.timedelta(days=KPI_WINDOW_DAYS - 1)), _sc_end)
-if is_sc_window:
-    st.info(f"Seller Center 30D window: {start:%d %b} to {end:%d %b}, the period the Seller Center morning figure covers. "
-            "Rates shown with 2 decimals. TikTok reproduces Seller Center to about 0.1 pt; Shopee and Lazada are within about 1 to 2 pts "
-            "(hourly rolling in Seller Center vs daily totals in the sheet; see the KPI section for details).")
 tiles = st.columns(4)
 for col, k in zip(tiles, ["all", "shp", "lzd", "ttk"]):
     chat, resp = int(rows[f"{k}_chat"].sum()), int(rows[f"{k}_resp"].sum())
@@ -608,7 +575,7 @@ for col, k in zip(tiles, ["all", "shp", "lzd", "ttk"]):
         st.markdown(f"<div style='border-left:6px solid {COLOR[k]};padding-left:10px'><b>{LABEL[k]}</b></div>", unsafe_allow_html=True)
         a, b = st.columns(2)
         a.metric("Total chats", fmt_n(chat), f"{chat / n:,.0f} per day", delta_color="off")
-        b.metric("Responded", fmt_n(resp), f"rate {r * 100:.2f}%" if (is_sc_window and r is not None) else f"rate {fmt_pct(r)}", delta_color="off")
+        b.metric("Responded", fmt_n(resp), f"rate {fmt_pct(r)}", delta_color="off")
         if k != "all" and r is not None:
             st.caption(("✅ above" if r >= KPI[k] else "⚠️ below") + f" KPI {KPI[k] * 100:.0f}% in this period")
 
