@@ -575,7 +575,7 @@ for col, k in zip(tiles, ["all", "shp", "lzd", "ttk"]):
         st.markdown(f"<div style='border-left:6px solid {COLOR[k]};padding-left:10px'><b>{LABEL[k]}</b></div>", unsafe_allow_html=True)
         a, b = st.columns(2)
         a.metric("Total chats", fmt_n(chat), f"{chat / n:,.0f} per day", delta_color="off")
-        b.metric("Responded", fmt_n(resp), f"rate {fmt_pct(r)}", delta_color="off")
+        b.metric("Responded", fmt_n(resp), f"rate {fmt_pct(r)}" if k != "all" else f"{resp / n:,.0f} per day", delta_color="off")
         if k != "all" and r is not None:
             st.caption(("✅ above" if r >= KPI[k] else "⚠️ below") + f" KPI {KPI[k] * 100:.0f}% in this period")
 
@@ -621,7 +621,8 @@ for t in DAY_TYPES:
     rec = {"Day type": t, "Days": len(sub)}
     for k in ["all", "shp", "lzd", "ttk"]:
         rec[f"{LABEL[k]} chats/day"] = sub[f"{k}_chat"].mean()
-        rec[f"{LABEL[k]} rate"] = rate(sub[f"{k}_resp"].sum(), sub[f"{k}_chat"].sum())
+        if k != "all":
+            rec[f"{LABEL[k]} rate"] = rate(sub[f"{k}_resp"].sum(), sub[f"{k}_chat"].sum())
     stats.append(rec)
 stats_df = pd.DataFrame(stats)
 bau_avg = float(stats_df.loc[stats_df["Day type"] == "BAU", "All channels chats/day"].iloc[0]) if "BAU" in set(stats_df["Day type"]) else None
@@ -656,7 +657,6 @@ for ev, g in dd_src[dd_src["type"] == "Double Digit"].groupby("dd_event", sort=F
     peak = g.loc[g["all_chat"].idxmax()]
     rec = {"Event": ev, "From": g["date"].min(), "To": g["date"].max(), "Days": len(g),
            "All chats": int(g["all_chat"].sum()), "Responded": int(g["all_resp"].sum()),
-           "All rate": rate(g["all_resp"].sum(), g["all_chat"].sum()),
            "Peak day": f"{peak['date']:%a %d %b} (day {int(peak['dd_day']) if pd.notna(peak['dd_day']) else '?'}) · {int(peak['all_chat']):,}"}
     for k, name, _ in CH:
         rec[name] = int(g[f"{k}_chat"].sum())
@@ -806,9 +806,10 @@ for t in ("Double Digit", "Mid Month", "Payday", "Other Campaign"):
     sub = in_range[in_range["type"] == t]
     bau = in_range[in_range["type"] == "BAU"]
     if len(sub) and len(bau):
-        r_c, r_b = rate(sub["all_resp"].sum(), sub["all_chat"].sum()), rate(bau["all_resp"].sum(), bau["all_chat"].sum())
-        if r_c is not None and r_b is not None and r_c < r_b - 0.05:
-            sugs.append(f"{t} days respond at {r_c:.0%} vs {r_b:.0%} on BAU days in this period: campaign volume is outrunning capacity, so add standby agents on {t} days.")
+        for k, name, _ in CH:
+            r_c, r_b = rate(sub[f"{k}_resp"].sum(), sub[f"{k}_chat"].sum()), rate(bau[f"{k}_resp"].sum(), bau[f"{k}_chat"].sum())
+            if r_c is not None and r_b is not None and r_c < r_b - 0.05:
+                sugs.append(f"{name} responds at {r_c:.0%} on {t} days vs {r_b:.0%} on BAU days in this period: campaign volume is outrunning capacity, so add standby agents for {name} on {t} days.")
 if not sugs:
     sugs.append("All channels are on KPI and campaign days hold their respond rate. Keep the current staffing and re-check before the next Double Digit.")
 for s in sugs:
@@ -818,7 +819,7 @@ for s in sugs:
 with st.expander("Daily data (selected period)"):
     show = rows[["date", "weekday", "type", "dd_event", "dd_day", "lzd_campaign", "shp_campaign",
                  "all_chat", "all_resp", "shp_chat", "shp_resp", "lzd_chat", "lzd_resp", "ttk_chat", "ttk_resp"]].copy()
-    for k in ["all", "shp", "lzd", "ttk"]:
+    for k in ["shp", "lzd", "ttk"]:
         show[f"{k}_rate"] = (show[f"{k}_resp"] / show[f"{k}_chat"].replace(0, pd.NA)).map(fmt_pct)
     st.dataframe(show, hide_index=True, use_container_width=True)
     st.download_button("Download CSV", show.to_csv(index=False).encode("utf-8"), "mkp_chat_daily.csv", "text/csv")
